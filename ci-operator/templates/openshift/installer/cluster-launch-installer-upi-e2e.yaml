@@ -132,6 +132,8 @@ objects:
         value: ${CLUSTER_TYPE}
       - name: CLUSTER_NAME
         value: ${NAMESPACE}-${JOB_NAME_HASH}
+      - name: JOB_NAME_SAFE
+        value: ${JOB_NAME_SAFE}
       command:
       - /bin/bash
       - -c
@@ -178,6 +180,9 @@ objects:
         mountPath: /srv
       - name: shared-tmp
         mountPath: /tmp/shared
+      env:
+      - name: JOB_NAME_SAFE
+        value: ${JOB_NAME_SAFE}
       workingDir: /srv
       command:
       - /bin/bash
@@ -185,6 +190,9 @@ objects:
       args:
       - |
         #!/bin/bash
+
+        [ "$JOB_NAME_SAFE" == "e2e-ipi" ] && exit
+
         set -euo pipefail
         cat <<END >>/tmp/serve.py
         import os, SocketServer, SimpleHTTPServer
@@ -238,6 +246,8 @@ objects:
         value: us-east-1
       - name: ARTIFACT_DIR
         value: /tmp/artifacts
+      - name: JOB_NAME_SAFE
+        value: ${JOB_NAME_SAFE}
       - name: HOME
         value: /tmp/home
       - name: KUBECONFIG
@@ -247,6 +257,9 @@ objects:
       - -c
       - |
         #!/bin/bash
+
+        [ "$JOB_NAME_SAFE" == "e2e-ipi" ] && echo exit
+
         set -euo pipefail
 
         export PATH=/usr/libexec/origin:$PATH
@@ -336,12 +349,16 @@ objects:
         value: us-east-1
       - name: CLUSTER_NAME
         value: ${NAMESPACE}-${JOB_NAME_HASH}
+      - name: JOB_NAME_SAFE
+        value: ${JOB_NAME_SAFE}
       - name: BASE_DOMAIN
         value: ${BASE_DOMAIN}
       - name: SSH_PUB_KEY_PATH
         value: /etc/openshift-installer/ssh-publickey
       - name: SSH_PRIVATE_KEY_PATH
         value: /etc/openshift-installer/ssh-privatekey
+      - name: PACKET_PROJECT_ID
+        value: b3c1623c-ce0b-45cf-9757-c61a71e06eac
       - name: PULL_SECRET_PATH
         value: /etc/openshift-installer/pull-secret
       - name: TFVARS_PATH
@@ -362,6 +379,116 @@ objects:
       - |
         #!/bin/sh
         set -e
+
+        if [ "$JOB_NAME_SAFE" == "e2e-ipi" ] ; then
+            set -x
+
+            finished()
+            {
+                set +e
+
+                if [ -n "$IP" ] ; then
+                    echo "Getting logs"
+                    ssh  $SSHOPTS root@$IP tar -czf - /root/dev-scripts/logs | tar -C /tmp/artifacts -xzf -
+                    sed -i -e 's/.*auths.*/*** PULL_SECRET ***/g' /tmp/artifacts/root/dev-scripts/logs/*
+                fi
+
+                echo "Deprovisioning cluster ..."
+                for r in {1..5}; do terraform destroy -auto-approve && break ; done
+
+                touch /tmp/shared/exit
+            }
+
+            SSHOPTS="-o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i $SSH_PRIVATE_KEY_PATH"
+            trap finished EXIT
+
+            mkdir -p /tmp/artifacts/terraform /tmp/shared || true
+
+            ls -lapd /output || true
+            id || true
+            whoami || true
+            cat /etc/passwd || true
+            realpath ~ || true
+
+            set +x
+            export PACKET_AUTH_TOKEN=$(cat /etc/openshift-installer/.packetcred)
+            set -x
+
+            cat > /tmp/artifacts/terraform/terraform.tf <<-EOF
+            provider "packet" {
+            }
+
+            resource "packet_spot_market_request" "req" {
+              depends_on = ["packet_ssh_key.ssh"]
+              project_id    = "$PACKET_PROJECT_ID"
+              max_bid_price = 0.5
+              facilities    = ["ewr1", "ewr1", "sjc1"]
+              devices_min   = 1
+              devices_max   = 1
+              wait_for_devices = true
+
+              instance_parameters {
+                hostname         = "ciserver-$JOB_NAME_HASH"
+                billing_cycle    = "hourly"
+                operating_system = "centos_7"
+                plan             = "c2.medium.x86"
+              }
+            }
+
+            resource "packet_ssh_key" "ssh" {
+                name       = "cikey-$JOB_NAME_HASH"
+                public_key = "$(cat $SSH_PUB_KEY_PATH)"
+            }
+            data "packet_device" "ciserver" {
+              depends_on = ["packet_spot_market_request.req"]
+              project_id       = "$PACKET_PROJECT_ID"
+              hostname         = "ciserver-$JOB_NAME_HASH"
+            }
+
+        EOF
+
+            cd /tmp/artifacts/terraform
+            terraform init
+            # Packet returns transients errors when creating devices.
+            # example, `Oh snap, something went wrong! We've logged the error and will take a look - please reach out to us if you continue having trouble.`
+            # therefore the terraform apply needs to be retried a few time before giving up.
+            rc=1
+            for r in {1..5}; do terraform apply -auto-approve && rc=0 && break ; done
+            if test "${rc}" -eq 1; then echo "failed to create the infra resources"; sleep 1; fi
+
+            IP=$(jq -r '.modules[0].resources["data.packet_device.ciserver"].primary.attributes.access_public_ipv4' terraform.tfstate)
+
+            while ! ssh $SSHOPTS root@$IP hostname ; do sleep 5 ; done
+
+            scp $SSHOPTS ${PULL_SECRET_PATH} root@$IP:pull-secret
+            timeout -s 9 175m ssh $SSHOPTS root@$IP bash - << EOF
+            set -ex
+
+            yum install -y git
+
+            export OPENSHIFT_RELEASE_IMAGE=registry.svc.ci.openshift.org/$NAMESPACE/release:latest
+            set +x
+            export PULL_SECRET=\$(cat pull-secret)
+            set -x
+
+            # python2-cryptography needs to come from delorean-master-testing, priority of packet.repo overrides it
+            # remove the priority and instead ensure the packet repo is named first alphabetically
+            # this way it is prefered but it isn't a hard override when newer versions are found elsewhere
+            sed -i -e 's/priority.*//g' /etc/yum.repos.d/packet.repo
+            sed -i -e 's/packet-/a_packet-/g' /etc/yum.repos.d/packet.repo
+
+            export ADDN_DNS=\$(awk '/nameserver/ { print \$2;exit; }' /etc/resolv.conf)
+
+            git clone https://github.com/openshift-metal3/dev-scripts.git
+            cd dev-scripts
+            touch /root/dev-scripts/config_root.sh
+            make |& sed -e 's/.*auths.*/*** PULL_SECRET ***/g'
+
+        EOF
+
+            exit $?
+        fi
+
         trap 'rc=$?; if test "${rc}" -eq 0; then touch /tmp/setup-success; else touch /tmp/exit; fi; exit "${rc}"' EXIT
         trap 'CHILDREN=$(jobs -p); if test -n "${CHILDREN}"; then kill ${CHILDREN} && wait; fi' TERM
 
@@ -782,6 +909,8 @@ objects:
       env:
       - name: CLUSTER_NAME
         value: ${NAMESPACE}-${JOB_NAME_HASH}
+      - name: JOB_NAME_SAFE
+        value: ${JOB_NAME_SAFE}
       - name: TYPE
         value: ${CLUSTER_TYPE}
       - name: KUBECONFIG
@@ -960,7 +1089,9 @@ objects:
           fi
         }
 
-        trap 'teardown' EXIT
+        if [ "$JOB_NAME_SAFE" != "e2e-ipi" ] ; then
+            trap 'teardown' EXIT
+        fi
         trap 'kill $(jobs -p); exit 0' TERM
 
         for i in $(seq 1 180); do
