@@ -54,6 +54,7 @@ tar -czf - . | ssh "${SSHOPTS[@]}" "root@${IP}" "cat > /root/dev-scripts.tar.gz"
 
 # Prepare configuration and run dev-scripts
 scp "${SSHOPTS[@]}" "${CLUSTER_PROFILE_DIR}/pull-secret" "root@${IP}:pull-secret"
+scp "${SSHOPTS[@]}" "${CLUSTER_PROFILE_DIR}/esi_cloud_yaml" "root@${IP}:esi_cloud_yaml"
 
 # Copy any additional manifests from previous CI steps
 export EXTRA_MANIFESTS=false
@@ -73,11 +74,7 @@ done <   <( find "${SHARED_DIR}" \( -name "manifest_*.yml" -o -name "manifest_*.
 # For baremetal clusters ofcir has returned details about the hardware in the cluster
 # prepare those details into a format the devscripts understands
 function prepare_bmcluster() {
-    # The extra data is missing the square brackets to prevent ironic parsing it as json
-    # FIXME: this should be fixed in ofcir or ironic
-    echo "[" > $EXTRAFILE
     jq -r .extra < $CIRFILE >> $EXTRAFILE
-    echo "]" >> $EXTRAFILE
 
     # dev-scripts can be used to provision baremetal (in place of the VM's it usually creates)
     # build the details of the bm nodes into a $NODES_FILE for consumption by dev-scripts
@@ -85,9 +82,13 @@ function prepare_bmcluster() {
     n=0
     _IFS=$IFS
     IFS=$'\n'
-    for DATA in $(cat $EXTRAFILE |jq '.[] | "\(.bmcip) \(.mac)"' -rc) ; do
-        IFS=" " read BMCIP MAC <<< "$(echo $DATA)"
-        NODES="$NODES{\"name\":\"openshift-$n\",\"driver\":\"ipmi\",\"resource_class\":\"baremetal\",\"driver_info\":{\"username\":\"root\",\"password\":\"calvin\",\"address\":\"ipmi://$BMCIP\",\"deploy_kernel\":\"http://172.22.0.2/images/ironic-python-agent.kernel\",\"deploy_ramdisk\":\"http://172.22.0.2/images/ironic-python-agent.initramfs\",\"disable_certificate_verification\":false},\"ports\":[{\"address\":\"$MAC\",\"pxe_enabled\":true}],\"properties\":{\"local_gb\":\"50\",\"cpu_arch\":\"x86_64\",\"boot_mode\":\"legacy\"}},"
+    for DATA in $(cat $EXTRAFILE |jq '.[] | "\(.bmcip) \(.mac) \(.driver) \(.system) \(.name)"' -rc) ; do
+        IFS=" " read BMCIP MAC DRIVER SYSTEM NAME<<< "$(echo $DATA)"
+        if [ "$DRIVER" == "redfish" ] ; then
+            NODES="$NODES{\"name\":\"$NAME\",\"driver\":\"redfish\",\"resource_class\":\"baremetal\",\"driver_info\":{\"username\":\"admin\",\"password\":\"password\",\"address\":\"redfish+http://$BMCIP:8000/redfish/v1/Systems/$SYSTEM\",\"deploy_kernel\":\"http://172.22.0.2/images/ironic-python-agent.kernel\",\"deploy_ramdisk\":\"http://172.22.0.2/images/ironic-python-agent.initramfs\",\"disable_certificate_verification\":false},\"ports\":[{\"address\":\"$MAC\",\"pxe_enabled\":true}],\"properties\":{\"local_gb\":\"50\",\"cpu_arch\":\"x86_64\",\"boot_mode\":\"legacy\"}},"
+        else
+            NODES="$NODES{\"name\":\"openshift-$n\",\"driver\":\"ipmi\",\"resource_class\":\"baremetal\",\"driver_info\":{\"username\":\"root\",\"password\":\"calvin\",\"address\":\"ipmi://$BMCIP\",\"deploy_kernel\":\"http://172.22.0.2/images/ironic-python-agent.kernel\",\"deploy_ramdisk\":\"http://172.22.0.2/images/ironic-python-agent.initramfs\",\"disable_certificate_verification\":false},\"ports\":[{\"address\":\"$MAC\",\"pxe_enabled\":true}],\"properties\":{\"local_gb\":\"50\",\"cpu_arch\":\"x86_64\",\"boot_mode\":\"legacy\"}},"
+        fi
         n=$((n+1))
     done
     IFS=$_IFS
@@ -105,17 +106,19 @@ EOF
     cat - <<EOF >> "${SHARED_DIR}/dev-scripts-additional-config"
 export NODES_FILE="/root/dev-scripts/bm.json"
 export NODES_PLATFORM=baremetal
-export PRO_IF="eth3"
-export INT_IF="eth2"
+export PRO_IF="eth0.460"
+export INT_IF="eth0.421"
 export MANAGE_BR_BRIDGE=n
-export CLUSTER_PRO_IF="enp3s0f1"
+export CLUSTER_PRO_IF="eno1"
 export MANAGE_INT_BRIDGE=n
 export ROOT_DISK_NAME="/dev/sda"
-export BASE_DOMAIN="ocpci.eng.rdu2.redhat.com"
-export EXTERNAL_SUBNET_V4="10.10.129.0/24"
+export BASE_DOMAIN=okd.on.massopen.cloud
 export ADDN_DNS="10.38.5.26"
-export PROVISIONING_HOST_EXTERNAL_IP=$IP
+export PROVISIONING_HOST_EXTERNAL_IP=192.168.55.79
 export NUM_WORKERS=2
+export EXTERNAL_BOOTSTRAP_MAC=52:54:00:B0:07:4F
+export EXTERNAL_SUBNET=192.168.112.0/24
+export NETWORK_CONFIG_FOLDER=/root/dev-scripts/network-configs/vlan-over-prov
 EOF
     scp "${SSHOPTS[@]}" "${SHARED_DIR}/bm.json" "root@${IP}:bm.json"
 }
@@ -163,7 +166,8 @@ set -xeuo pipefail
 # about the Packet provisioner, remove the file if it's present.
 test -f /usr/config && rm -f /usr/config || true
 
-yum install -y git sysstat sos make
+yum install -y git sysstat sos make podman tmux python3-virtualenv python39 net-tools ipmitool httpd-tools
+
 systemctl start sysstat
 
 mkdir -p /tmp/artifacts
@@ -193,6 +197,19 @@ fi
 sysctl -w net.ipv6.conf.\$(ip -o route get 1.1.1.1 | cut -f 5 -d ' ').accept_ra=2
 
 cd dev-scripts
+git fetch https://github.com/derekhiggins/dev-scripts setmac
+git cherry-pick FETCH_HEAD
+
+mkdir -p network-configs/vlan-over-prov
+
+# Not dev-scripts
+export PROV_BM_MAC=fa:16:3e:76:17:07
+export PROV_BM_IP=192.168.112.1
+export PROV_BM_GATE=192.168.112.254
+export VLANID_PR=460
+export VLANID_BM=421
+export PROV_FIP=128.31.20.109
+export CLUSTER_FIP=128.31.20.97
 
 cp /root/pull-secret /root/dev-scripts/pull_secret.json
 
@@ -223,7 +240,8 @@ if [[ "${ARCHITECTURE}" == "arm64" ]]; then
   echo "export SUSHY_TOOLS_IMAGE=quay.io/multi-arch/sushy-tools:muiltarch" >> /root/dev-scripts/config_root.sh
   echo "export VBMC_IMAGE=quay.io/multi-arch/vbmc:arm" >> /root/dev-scripts/config_root.sh
 else
-  echo "export OPENSHIFT_RELEASE_IMAGE=${OPENSHIFT_INSTALL_RELEASE_IMAGE}" >> /root/dev-scripts/config_root.sh
+  # need https://github.com/openshift/ironic-agent-image/pull/83
+  echo "export OPENSHIFT_RELEASE_IMAGE=quay.io/okd/scos-release:4.13.0-0.okd-scos-2023-06-23-041457" >> /root/dev-scripts/config_root.sh
 fi
 
 # Inject PR additional configuration, if available
@@ -241,26 +259,60 @@ if [ -e /root/bm.json ] ; then
 
     # On baremetal clusters DNS has been setup so that the clustername is part of the provision host long name
     # i.e. hostname == host1.clusterXX.ocpci.eng.rdu2.redhat.com
-    export LOCAL_REGISTRY_DNS_NAME=\$(hostname -f)
-    export "CLUSTER_NAME=\$(hostname -f | cut -d . -f 2)"
+    # Aug 23 13:45:02.183: INFO: At 2023-08-23 13:40:05 +0000 UTC - event for startup-override-26bee604-2d34-4857-a613-840456cf6ad9: {kubelet host-192-168-112-67} Failed: Failed to pull image "host-192-168-55-79:5000/localimages/local-test-image:e2e-1-registry-k8s-io-e2e-test-images-agnhost-2-43-uvjrRUnF2eM_DB5-": rpc error: code = Unknown desc = pinging container registry host-192-168-55-79:5000: Get "https://host-192-168-55-79:5000/v2/": dial tcp: lookup host-192-168-55-79 on 192.168.112.67:53: no such host
+    export LOCAL_REGISTRY_DNS_NAME=virthost.ci-01.okd.on.massopen.cloud
+    export CLUSTER_NAME=ci-01
 
     echo "export LOCAL_REGISTRY_DNS_NAME=\$LOCAL_REGISTRY_DNS_NAME" >> /root/dev-scripts/config_root.sh
     echo "export CLUSTER_NAME=\$CLUSTER_NAME" >> /root/dev-scripts/config_root.sh
 
     cp /root/bm.json /root/dev-scripts/bm.json
 
-    nmcli --fields UUID c show | grep -v UUID | xargs -t -n 1 nmcli con delete
-    nmcli con add ifname \${CLUSTER_NAME}bm type bridge con-name \${CLUSTER_NAME}bm bridge.stp off
-    nmcli con add type ethernet ifname eth2 master \${CLUSTER_NAME}bm con-name \${CLUSTER_NAME}bm-eth2
+    # Need a way to get this content from the cir
+    echo H4sIAAAAAAAAA+2XS26DMBBAWecUVvak2BiTzrYnMXgoURJAhhDl9jUoqDQqiirlo4Z5G/DY4LGHJ6Dd6cIvW7R+Zcv2zbsHgSOOou7I4ygYHwc8LmUUxmEUx8ILeCiU8Fh0l2wuONSNtox5Bi1u8+lx1/r/Ke3P+pdpI/0016HP09VJ73e3mKMrsJJysv5KyHP9pQi6cVxxF2LBLSa/xszrX2BzLO32oyyyzScsGNsUDdpMp1h3LZ8Veo/AsCi5azLWnKqu2eRo3aV9yG1g42KHqm9tqlZCf8aYydMKWGMPeA5goZMdmlHMDVcw2TvcItO7Gi/SWUkxTql7kH9JZ69TXxtjsa6BLTMNXEGIECpQBrhe9oO6a4ckEl2jv+k2YLRql6dLa5jwT0v8TrkSdXBlD015LBaLR9Z/wn/pc/Nc/xX5/whm6r8SINYgyf9J/8OE/B9D/r+S/1kMHAET8n/y/f9k/+n7/yHM1P+AQ/QOUpL/k/4/+f8/Iv8fwUz9jxNYG8jWs/efIAiCIAiCIAiCIAiCeG2+AMBAcB8AKAAA | base64 -d | tar -C network-configs -xzf -
+
+    podman pull quay.io/metal3-io/ironic
+
+    nmcli c s | grep -e ci-01 -e vlan | awk '{print \$1}' | sudo xargs -r -t nmcli c del || true
+
+    nmcli c modify "System eth0" ipv4.dns \$PROV_BM_IP ipv4.ignore-auto-dns yes
+    nmcli c down "System eth0"
+    nmcli c up "System eth0"
+    nmcli connection add type vlan con-name eth0.\$VLANID_PR dev eth0 id \$VLANID_PR ipv4.method disabled ipv6.method disabled
+    nmcli con add type bridge con-name ci-01bm ifname ci-01bm ipv4.method manual ipv4.address "\$PROV_BM_IP/24" ipv4.gateway "\$PROV_BM_GATE" ipv4.dns \$PROV_BM_IP ipv4.ignore-auto-dns yes
+    nmcli connection add type vlan con-name eth0.\$VLANID_BM dev eth0 id \$VLANID_BM ipv4.method disabled ipv6.method disabled 802-3-ethernet.cloned-mac-address \$PROV_BM_MAC master ci-01bm
     nmcli con reload
     sleep 10
 
-    # Block the public zone (where eth2 is) from allowing and traffic from the provisioning network
-    # prevents arp responses from provisioning networks on other bm environment i.e.
-    # ERROR     : [/etc/sysconfig/network-scripts/ifup-eth] Error, some other host (F8:F2:1E:B2:DA:21) already uses address 172.22.0.1.
-    echo 1 | sudo dd of=/proc/sys/net/ipv4/conf/eth2/arp_ignore
-    # TODO: remove this once all running CI jobs are updated (i.e. its only  needed until arp_ignore is set on all environments)
-    sudo firewall-cmd --zone=public --add-rich-rule='rule family="ipv4" source address="172.22.0.0/24" destination address="172.22.0.0/24" reject' --permanent
+    podman rm -f dnsmasqbm
+    mkdir ~/resources
+    echo IyBTZXQgdGhlIGRvbWFpbiBuYW1lCmRvbWFpbj1jaS0wMS5va2Qub24ubWFzc29wZW4uY2xvdWQKCnNlcnZlcj04LjguOC44CmludGVyZmFjZT1jaS0wMWJtCmxpc3Rlbi1hZGRyZXNzPTE5Mi4xNjguMTEyLjEKZXhjZXB0LWludGVyZmFjZT1sbwpiaW5kLWR5bmFtaWMKCiMgQWRkIGFkZGl0aW9uYWwgRE5TIGVudHJpZXMKYWRkcmVzcz0vYXBpLmNpLTAxLm9rZC5vbi5tYXNzb3Blbi5jbG91ZC8xOTIuMTY4LjExMi41CmFkZHJlc3M9L3ZpcnRob3N0LmNpLTAxLm9rZC5vbi5tYXNzb3Blbi5jbG91ZC8xOTIuMTY4LjExMi4xCgojIEFkZCBhIHdpbGRjYXJkIEROUyBlbnRyeQphZGRyZXNzPS8uYXBwcy5jaS0wMS5va2Qub24ubWFzc29wZW4uY2xvdWQvMTkyLjE2OC4xMTIuNAo= | base64 -d > ~/resources/dnsmasq.conf
+    podman run --name dnsmasqbm -d --privileged --net host -v ~/resources:/conf quay.io/metal3-io/ironic dnsmasq -C /conf/dnsmasq.conf -d -q
+
+    if [ ! -f ~root/.ssh/id_rsa.pub ]; then
+        ssh-keygen -f ~root/.ssh/id_rsa -P ""
+    fi
+
+    cd ~
+    [ -e sushy-tools ] || git clone https://github.com/derekhiggins/sushy-tools.git -b esi
+    cd sushy-tools/
+    [ -e venv ] || virtualenv-3.6 --python python3.9 venv
+    ./venv/bin/pip install -r requirements.txt
+    ./venv/bin/pip install . python-openstackclient python-ironicclient
+
+    mkdir -p ~/.sushy-tools
+    echo 'SUSHY_EMULATOR_LIBVIRT_URI = "qemu+ssh://root@localhost/system?&keyfile=/root/ssh/id_rsa_virt_power&no_verify=1&no_tty=1"' > ~/.sushy-tools/conf.py
+    echo -e 'SUSHY_EMULATOR_IGNORE_BOOT_DEVICE = False\nSUSHY_EMULATOR_VMEDIA_VERIFY_SSL = False' >> ~/.sushy-tools/conf.py
+    echo -e "SUSHY_EMULATOR_AUTH_FILE = '\$HOME/.sushy-tools/htpasswd'" >> ~/.sushy-tools/conf.py
+    echo -e "SUSHY_EMULATOR_IRONIC_CLOUD = 'openstack'" >> ~/.sushy-tools/conf.py
+    htpasswd -Bbn admin password > ~/.sushy-tools/htpasswd
+    cat ~root/.ssh/id_rsa.pub | sudo tee -a ~root/.ssh/authorized_keys
+
+    cat ~/esi_cloud_yaml | base64 -d > clouds.yaml
+
+    nohup ./venv/bin/sushy-emulator --config /root/.sushy-tools/conf.py -i :: >> sushy-emulator.log 2>&1 &
+
+    cd ~/dev-scripts
 
     sudo firewall-cmd --reload
 
@@ -269,14 +321,18 @@ else
     echo 'export KUBECONFIG=/root/dev-scripts/ocp/ostest/auth/kubeconfig' >> /root/.bashrc
 fi
 
-timeout -s 9 105m make ${DEVSCRIPTS_TARGET}
+# squid neets to pick up something that changed since it was started (I guess the changed to resolv.conf
+podman restart --time 1 external-squid || true
+
+timeout -s 9 135m make ${DEVSCRIPTS_TARGET}
 
 # Add extra CI specific rules to the libvirt zone, this can't be done earlier because the zone only now exists
 # TODO: In reality the bridges should be in the public zone
 if [ -e /root/bm.json ] ; then
     # Allow cluster nodes to use provising node as a ntp server (4.12 and above are more likely to use it vs. the dhcp set server)
     sudo firewall-cmd --add-service=ntp --zone libvirt
-    sudo firewall-cmd --add-port=8213/tcp --zone=libvirt
+    sudo firewall-cmd --add-service=ntp --zone public
+    sudo firewall-cmd --add-port=8213/tcp --zone libvirt
 fi
 EOF
 

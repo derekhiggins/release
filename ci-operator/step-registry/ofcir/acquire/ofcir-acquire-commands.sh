@@ -71,7 +71,8 @@ EOF
 
 function getCIR(){
     OFCIRURL="https://ofcir-service.ofcir-system.svc.cluster.local/v1/ofcir"
-    OFCIRTOKEN="$(cat ${CLUSTER_PROFILE_DIR}/ofcir-auth-token)"
+    # Temp testing token
+    OFCIRTOKEN="a90a2157-09b2-4e30-9174-23e647787ab2"
     echo "Attempting to acquire a Host from OFCIR"
     IPFILE=$SHARED_DIR/server-ip
     CIRFILE=$SHARED_DIR/cir
