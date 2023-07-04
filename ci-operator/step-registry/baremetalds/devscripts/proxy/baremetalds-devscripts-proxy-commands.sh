@@ -23,7 +23,7 @@ sudo systemctl restart sshd
 
 # Setup squid proxy for accessing cluster
 cat <<SQUID>\$HOME/squid.conf
-acl cluster dstdomain .metalkube.org .ocpci.eng.rdu2.redhat.com
+acl cluster dstdomain .metalkube.org .ocpci.eng.rdu2.redhat.com .okd.on.massopen.cloud
 http_access allow cluster
 http_access deny all
 http_port 8213
@@ -46,7 +46,6 @@ sudo podman run -d --rm \
      --net host \
      --volume \$HOME/squid.conf:/etc/squid/squid.conf \$EXTRAVOLUMES \
      --name external-squid \
-     --dns 127.0.0.1 \
      quay.io/openshifttest/squid-proxy:multiarch
 EOF
 
