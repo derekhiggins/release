@@ -79,4 +79,12 @@ then
   podman cp external-squid:/var/log/squid/cache.log /tmp/squid-logs-$NAMESPACE || true
   tar -czC "/tmp" -f "/tmp/artifacts/squid-logs-$NAMESPACE.tar.gz" squid-logs-$NAMESPACE/
 fi
+
+# Grab journals off hosts
+for BMHIP in \$(oc get -A bmh -o yaml  | yq .items[].status.hardware.nics[0].ip -r) ; do
+    ssh -o 'ConnectTimeout=5' -o 'StrictHostKeyChecking=no' -o 'UserKnownHostsFile=/dev/null' -o 'ServerAliveInterval=90' -o LogLevel=ERROR core@\$BMHIP sudo journalctl > /tmp/artifacts/\$BMHIP.journal
+    gzip /tmp/artifacts/\$BMHIP.journal
+done
+
+
 EOF
